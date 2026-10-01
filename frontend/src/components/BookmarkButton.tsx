@@ -1,18 +1,42 @@
 "use client";
 
-import React from 'react';
+import React, { useSyncExternalStore } from 'react';
 import { Bookmark } from 'lucide-react';
+import {
+  BookmarkItem,
+  getBookmarksSnapshot,
+  getServerBookmarksSnapshot,
+  parseBookmarks,
+  subscribeBookmarks,
+  toggleBookmark,
+} from '@/lib/bookmarks';
 
-export default function BookmarkButton({ size = 18 }: { size?: number }) {
+interface BookmarkButtonProps {
+  item: Omit<BookmarkItem, 'saved_at'>;
+  size?: number;
+  className?: string;
+}
+
+export default function BookmarkButton({ item, size = 18, className = '' }: BookmarkButtonProps) {
+  const raw = useSyncExternalStore(subscribeBookmarks, getBookmarksSnapshot, getServerBookmarksSnapshot);
+  const isSaved = parseBookmarks(raw).some((b) => b.url === item.url);
+
   return (
-    <button 
+    <button
+      type="button"
       onClick={(e) => {
         e.preventDefault();
-        alert("북마크에 저장되었습니다.");
+        e.stopPropagation();
+        toggleBookmark(item);
       }}
-      className="text-gray-400 hover:text-black flex items-center transition"
+      aria-pressed={isSaved}
+      aria-label={isSaved ? '북마크 해제' : '북마크에 저장'}
+      title={isSaved ? '북마크 해제' : '북마크에 저장'}
+      className={`flex items-center transition ${
+        isSaved ? 'text-[#e63946]' : 'text-gray-400 hover:text-black'
+      } ${className}`}
     >
-      <Bookmark size={size} />
+      <Bookmark size={size} fill={isSaved ? 'currentColor' : 'none'} />
     </button>
   );
 }

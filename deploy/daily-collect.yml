@@ -1,0 +1,70 @@
+# 매일 뉴스·주식 자동 수집 (GitHub Actions)
+#  - 매일 06:00 (한국 시간) : 뉴스 수집 + AI 리포트 + 전 거래일 주식 시세   → python main.py --now
+#  - 평일 16:00 (한국 시간) : 장 마감 후 당일 확정 주식 시세                → python main.py --stock
+# GitHub의 예약 시각은 UTC 기준이라 한국 시간에서 9시간을 뺀 값으로 적습니다.
+# (GitHub 사정에 따라 실제 실행이 5~30분 정도 늦어질 수 있습니다)
+
+name: Daily Collect
+
+on:
+  schedule:
+    - cron: "0 21 * * *"    # 매일 21:00 UTC = 다음날 06:00 KST
+    - cron: "0 7 * * 1-5"   # 평일 07:00 UTC = 16:00 KST
+  workflow_dispatch:        # Actions 탭에서 수동 실행 버튼
+    inputs:
+      job:
+        description: "실행할 작업"
+        required: true
+        default: "stock"
+        type: choice
+        options:
+          - stock   # 주식 시세만 (빠름)
+          - daily   # 뉴스 + AI 리포트 + 주식 (전체)
+
+concurrency:
+  group: daily-collect
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      PYTHONIOENCODING: utf-8
+      TZ: Asia/Seoul
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: backend/requirement.txt
+
+      - name: 패키지 설치
+        run: pip install -r requirement.txt
+
+      - name: 실행할 작업 결정
+        id: pick
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "job=${{ inputs.job }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.schedule }}" = "0 7 * * 1-5" ]; then
+            echo "job=stock" >> "$GITHUB_OUTPUT"
+          else
+            echo "job=daily" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 주식 시세 수집 (16:00)
+        if: steps.pick.outputs.job == 'stock'
+        run: python main.py --stock
+
+      - name: 뉴스 + AI 리포트 + 주식 수집 (06:00)
+        if: steps.pick.outputs.job == 'daily'
+        run: python main.py --now

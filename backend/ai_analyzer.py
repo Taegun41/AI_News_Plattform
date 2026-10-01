@@ -2,6 +2,7 @@ import os
 import json
 import time
 import difflib
+import traceback
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -37,6 +38,13 @@ class Track2Report(BaseModel):
     impact_analysis: str
     key_urls: list[str]
     meta_info: str | None = None
+
+class Track2AIOutput(BaseModel):
+    """Gemini에게 요청하는 응답 형식. (검색어·메타 정보는 코드에서 직접 채우므로 제외)"""
+    theme_summary: str
+    detailed_viewpoints: list[str]
+    impact_analysis: str
+    key_urls: list[str]
 # ----------------------------------------------------
 
 def run_track1_daily_clustering(raw_news_data):
@@ -52,7 +60,7 @@ def run_track1_daily_clustering(raw_news_data):
     # AI에게 전달할 뉴스 텍스트 생성
     news_text = ""
     for idx, article in enumerate(raw_news_data):
-        news_text += f"[{idx+1}] 제목: {article.get('title')}\nURL: {article.get('url')}\n내용: {article.get('body')[:200]}...\n\n"
+        news_text += f"[{idx+1}] 제목: {article.get('title')}\nURL: {article.get('url')}\n내용: {(article.get('body') or '')[:200]}...\n\n"
 
     prompt_step1 = f"""
     다음은 오늘 수집된 뉴스 기사들입니다. 이 기사들을 '정치', '경제', '사회', 'IT/과학', '세계' 등의 분야(sector_name)로 분류하고, 
@@ -143,63 +151,104 @@ def calculate_similarity(text1, text2):
     return difflib.SequenceMatcher(None, text1, text2).ratio()
 
 
+# 트랙 2에서 AI에게 보내는 기사 수와 기사당 본문 길이 (토큰 사용량·응답 속도 조절용)
+TRACK2_MAX_CANDIDATES = 60      # 중복 검사 대상 최대 기사 수 (최신순)
+TRACK2_BODY_CHARS = 1500        # AI에게 보내는 기사당 본문 최대 글자 수
+TRACK2_SIMILARITY_CHARS = 800   # 중복 검사에 사용하는 본문 앞부분 글자 수
+
+
 def run_track2_dynamic_search(keyword, raw_news_data, api_key, max_articles=15):
     """
-    [트랙 2] 키워드 검색 후, 본문 유사도가 80% 미만인 독립적인 기사들만 추려 맞춤형 리포트를 생성합니다.
+    [트랙 2] DB에서 이미 키워드로 걸러진 기사들 중, 본문 유사도가 80% 미만인 독립적인 기사들만 추려
+    맞춤형 리포트를 생성합니다.
     """
-    client = genai.Client(api_key=api_key)
-    
     if not raw_news_data:
         return {"error": "뉴스 원본 데이터가 없습니다."}
+    if not api_key:
+        return {"error": "GEMINI_API_KEY가 설정되지 않았습니다. backend/.env 파일을 확인해주세요."}
 
-    keyword_matched_news = []
-    for article in raw_news_data:
-        if keyword in article.get('title', '') or keyword in article.get('body', ''):
-            keyword_matched_news.append(article)
-            
-    if not keyword_matched_news:
-        return {"error": f"'{keyword}' 관련 기사를 찾을 수 없습니다."}
+    track2_client = genai.Client(api_key=api_key)
+
+    # DB 검색(db_client.search_raw_news_within_week)에서 이미 단어별·띄어쓰기 무시 매칭을 끝냈으므로
+    # 여기서는 다시 거르지 않습니다. (예전에는 검색어 전체 문자열로 다시 걸러서 여러 단어 검색이 실패했습니다)
+    keyword_matched_news = raw_news_data[:TRACK2_MAX_CANDIDATES]
 
     unique_news = []
     for new_article in keyword_matched_news:
+        new_body = (new_article.get('body') or '')[:TRACK2_SIMILARITY_CHARS]
         is_duplicate = False
         for existing_article in unique_news:
-            similarity = calculate_similarity(new_article['body'], existing_article['body'])
-            if similarity >= 0.8:
+            existing_body = (existing_article.get('body') or '')[:TRACK2_SIMILARITY_CHARS]
+            if calculate_similarity(new_body, existing_body) >= 0.8:
                 is_duplicate = True
                 break
-        
         if not is_duplicate:
             unique_news.append(new_article)
-            
-    unique_news = unique_news[:max_articles]
+        if len(unique_news) >= max_articles:
+            break
+
+    # AI에게는 분석에 필요한 필드만, 본문은 적당히 잘라서 보냅니다.
+    articles_for_ai = [
+        {
+            "title": article.get('title'),
+            "url": article.get('url'),
+            "date": article.get('date'),
+            "sector": article.get('theme_sector'),
+            "body": (article.get('body') or '')[:TRACK2_BODY_CHARS],
+        }
+        for article in unique_news
+    ]
 
     prompt_step2_dynamic = f"""
     당신은 사용자 맞춤형 금융 비서입니다. 사용자가 '{keyword}' 테마에 대해 검색했습니다.
     제공된 뉴스들은 텍스트 유사도 검사를 거쳐 중복 내용이 제거된 독립적인 기사들입니다.
-    
+
     지침:
     1. theme_summary: 이 테마의 전반적인 핵심 이슈를 요약하세요.
     2. detailed_viewpoints: 기사들이 다루는 세부적인 관점이나 팩트를 개별 리스트로 나열하세요.
     3. impact_analysis: 이 이슈가 관련 산업이나 시장에 미칠 영향을 분석하세요.
     4. key_urls: 참고한 기사들의 실제 URL을 모두 포함하세요. (가짜 URL 생성 절대 금지)
-    
+
     분석할 고순도 뉴스 데이터:
-    {json.dumps(unique_news, ensure_ascii=False)}
+    {json.dumps(articles_for_ai, ensure_ascii=False)}
     """
 
-    try:
-        response = client.models.generate_content(
-            model='gemini-3.5-flash',
-            contents=prompt_step2_dynamic,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=Track2Report
+    max_retries = 3
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            response = track2_client.models.generate_content(
+                model='gemini-3.5-flash',
+                contents=prompt_step2_dynamic,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=Track2AIOutput
+                )
             )
-        )
-        report_data = json.loads(response.text)
-        report_data['search_keyword'] = keyword
-        report_data['meta_info'] = f"총 {len(keyword_matched_news)}건 검색, 중복 제거 후 {len(unique_news)}건 요약 완료"
-        return report_data
-    except Exception as e:
-        return {"error": f"AI 분석 중 오류 발생: {str(e)}"}
+            if not response.text:
+                raise ValueError("Gemini가 빈 응답을 반환했습니다. (안전 필터에 걸렸을 수 있습니다)")
+
+            report_data = json.loads(response.text)
+            report_data['search_keyword'] = keyword
+            report_data['meta_info'] = f"총 {len(raw_news_data)}건 검색, 중복 제거 후 {len(unique_news)}건 요약 완료"
+
+            # 실제로 제공한 기사 URL만 남겨서 AI가 지어낸 URL을 걸러냅니다.
+            valid_urls = {article.get('url') for article in unique_news}
+            report_data['key_urls'] = [url for url in report_data.get('key_urls', []) if url in valid_urls]
+
+            # 프론트엔드 우측 리스트에 띄우기 위해 날짜 최신순으로 정렬합니다.
+            unique_news.sort(key=lambda x: x.get('date') or '', reverse=True)
+
+            return {
+                "ai_report": report_data,
+                "articles": unique_news
+            }
+        except Exception as e:
+            last_error = e
+            print(f"[트랙 2 오류] '{keyword}' AI 분석 실패 (시도 {attempt + 1}/{max_retries}): {e}")
+            traceback.print_exc()
+            if attempt < max_retries - 1:
+                # 요청 한도 초과(429)나 일시적 서버 오류(503)에 대비해 점점 길게 기다렸다가 재시도합니다.
+                time.sleep(3 * (attempt + 1))
+
+    return {"error": f"AI 분석 중 오류 발생: {last_error}"}

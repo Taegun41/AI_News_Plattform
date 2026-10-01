@@ -2,7 +2,7 @@ import os
 import json
 import datetime
 from bs4 import BeautifulSoup
-from utils import get_secure_session, random_delay
+from utils import get_secure_session, random_delay, now_kst
 
 # 분야 코드를 한글 테마명으로 변환하기 위한 딕셔너리
 SECTION_MAP = {
@@ -87,7 +87,14 @@ def parse_news_article(url, section_id):
         
         title = title_element.text.strip() if title_element else "제목 없음"
         body = body_element.get_text(separator=' ', strip=True) if body_element else "본문 없음"
-        date = date_element.attrs.get('data-date-time', '날짜 없음') if date_element else "날짜 없음"
+        date = date_element.attrs.get('data-date-time') if date_element else None
+        if not date:
+            # 일부 기사(연예·스포츠 등)는 날짜 위치가 달라서, data-date-time 속성이 있는 아무 요소나 한 번 더 찾습니다.
+            alt_date_element = soup.select_one('[data-date-time]')
+            date = alt_date_element.attrs.get('data-date-time') if alt_date_element else None
+        if not date:
+            # 그래도 없으면 수집한 당시 시각으로 채웁니다. (검색의 '최근 7일' 필터와 정렬이 정상 동작하도록)
+            date = now_kst().strftime('%Y-%m-%d %H:%M:%S')
         
         # 추가된 로직: 앞서 정의한 썸네일 추출 함수 호출
         thumbnail_url = extract_thumbnail_url(soup)
@@ -130,7 +137,7 @@ if __name__ == "__main__":
         random_delay(1.0, 2.5)
         
     if crawled_data:
-        now = datetime.datetime.now()
+        now = now_kst()
         year_month = now.strftime('%Y-%m')
         today_str = now.strftime('%Y%m%d')
         
@@ -139,4 +146,4 @@ if __name__ == "__main__":
         
         file_name = os.path.join(archive_dir, f'naver_economy_news_{today_str}.json')
         save_news_to_json(crawled_data, file_name)
-        print(f"\n단독 테스트 완료! 결과가 {file_name}에 저장되었습니다.")
+        print(f"\n단독 테스트 완료! 결과가 {file_name}에 저장되었습니다.")

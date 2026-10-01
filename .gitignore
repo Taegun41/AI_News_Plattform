@@ -1,0 +1,17 @@
+# 비밀 키 (절대 올리지 않기)
+.env
+.env.*
+
+# 파이썬 캐시 / 가상환경
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 로컬 백업 데이터 (실제 데이터는 Supabase에 저장됨)
+archive_data/
+backend/archive_data/
+
+# 기타
+.DS_Store
+Thumbs.db
