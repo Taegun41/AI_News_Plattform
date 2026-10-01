@@ -165,22 +165,14 @@ _live_index_lock = threading.Lock()
 
 
 def _fetch_live_index_history():
-    """FinanceDataReader로 지수를 실시간 조회합니다. (실패하면 None)"""
+    """지수를 실시간 조회합니다. (5분간 결과 재사용, 실패하면 None)"""
     with _live_index_lock:
         if _live_index_cache["data"] and time.time() - _live_index_cache["saved_at"] < LIVE_INDEX_CACHE_SECONDS:
             return _live_index_cache["data"]
         try:
-            import FinanceDataReader as fdr
-            start = (now_kst() - datetime.timedelta(days=120)).strftime('%Y-%m-%d')
-            data = {}
-            for code in INDEX_NAMES:
-                df = fdr.DataReader(code, start)
-                data[code] = [
-                    {"date": idx.strftime('%Y-%m-%d'), "close": round(float(row['Close']), 2)}
-                    for idx, row in df.iterrows()
-                    if row['Close'] == row['Close']
-                ]
-            if not all(data.values()):
+            from index_source import fetch_index_history
+            data = fetch_index_history(days=120)
+            if not all(data.get(code) for code in INDEX_NAMES):
                 return None
             _live_index_cache.update(saved_at=time.time(), data=data)
             return data
@@ -202,7 +194,12 @@ def build_index_cards(saved_indices, trade_date, is_latest):
 
     cards = []
     for code, name in INDEX_NAMES.items():
-        history = ((live or {}).get(code) or (saved_indices or {}).get(code) or [])
+        live_history = (live or {}).get(code) or []
+        saved_history = (saved_indices or {}).get(code) or []
+        # 두 출처 중 더 최근 날짜까지 있는 쪽을 사용합니다. (한쪽 출처가 갱신을 멈춘 경우 대비)
+        live_last = live_history[-1]["date"] if live_history else ""
+        saved_last = saved_history[-1]["date"] if saved_history else ""
+        history = live_history if live_last >= saved_last else saved_history
         if not is_latest:
             history = [h for h in history if h["date"] <= trade_date]
         history = history[-INDEX_HISTORY_POINTS:]
@@ -217,7 +214,7 @@ def build_index_cards(saved_indices, trade_date, is_latest):
             "close": last["close"],
             "change": round(change, 2),
             "change_ratio": round(change / prev["close"] * 100, 2) if prev["close"] else 0,
-            "status": "장중" if (live and last["date"] == today and market_open_now) else "장마감",
+            "status": "장중" if (history is live_history and last["date"] == today and market_open_now) else "장마감",
             "history": history,
         })
     return cards

@@ -4,6 +4,7 @@ import datetime
 import FinanceDataReader as fdr
 
 from utils import now_kst
+from index_source import fetch_index_history
 from stock_service import parse_stock_records, build_daily_record, build_price_rows
 
 # 지수 코드 (FinanceDataReader 기준)
@@ -37,35 +38,31 @@ def fetch_all_stock_data():
         return None
 
 
-def fetch_index_history(days=120):
-    """
-    코스피·코스닥 지수의 최근 일별 종가를 가져옵니다.
-    반환: {"KS11": [{"date": "2026-10-01", "close": 6971.35}, ...], "KQ11": [...]}
-    """
-    start = (now_kst() - datetime.timedelta(days=days)).strftime('%Y-%m-%d')
-    result = {}
-    for code in INDEX_CODES:
-        try:
-            df = fdr.DataReader(code, start)
-            result[code] = [
-                {"date": idx.strftime('%Y-%m-%d'), "close": round(float(row['Close']), 2)}
-                for idx, row in df.iterrows()
-                if row['Close'] == row['Close']  # NaN 제외
-            ]
-        except Exception as e:
-            print(f"[{code}] 지수 데이터 수집 중 오류 발생: {e}")
-            result[code] = []
-    return result
+def weekday_trade_date(now):
+    """평일 기준 추정 거래일: 장 마감 후 평일이면 오늘, 아니면 직전 평일 (공휴일은 모름)"""
+    day = now.date()
+    if not (day.weekday() < 5 and now.time() >= MARKET_FINAL):
+        day -= datetime.timedelta(days=1)
+        while day.weekday() >= 5:
+            day -= datetime.timedelta(days=1)
+    return day.strftime('%Y-%m-%d')
+
+
+# 지수 데이터의 마지막 날짜가 평일 추정일보다 이만큼 이상 오래되면, 지수 출처가 멈춘 것으로 보고 믿지 않습니다.
+# (추석·설 연휴는 최대 5일 정도라 그보다 여유 있게 잡음)
+INDEX_STALE_DAYS = 6
 
 
 def determine_trade_date(index_history, now=None):
     """
     지금 수집한 시세가 '어느 거래일의 확정 시세'인지 계산합니다.
-    - 지수 데이터의 마지막 날짜가 실제 마지막 거래일입니다. (주말·공휴일 자동 반영)
-    - 지수를 못 가져왔으면 평일 기준으로 추정합니다.
+    - 지수 데이터의 마지막 날짜를 마지막 거래일로 봅니다. (주말·공휴일 자동 반영)
+    - 단, 지수 출처가 갱신을 멈춰 날짜가 너무 오래됐거나 지수를 못 가져왔으면 평일 기준으로 추정합니다.
+      (예전에 지수 출처가 9/17에서 멈춰 10/1 시세가 9/17로 저장된 문제 방지)
     """
     now = now or now_kst()
     today = now.strftime('%Y-%m-%d')
+    estimate = weekday_trade_date(now)
 
     dates = [item["date"] for item in index_history.get("KS11", []) if item["date"] <= today]
     if dates:
@@ -73,17 +70,14 @@ def determine_trade_date(index_history, now=None):
         # 장 마감 전(이른 아침)에 오늘 날짜 행이 섞여 들어와도 오늘은 아직 확정되지 않았으므로 제외
         if last_date == today and now.time() < MARKET_FINAL:
             earlier = [d for d in dates if d < today]
-            if earlier:
-                return max(earlier)
-        return last_date
+            last_date = max(earlier) if earlier else estimate
 
-    # 대체 계산: 장 마감 후 평일이면 오늘, 아니면 직전 평일
-    day = now.date()
-    if not (day.weekday() < 5 and now.time() >= MARKET_FINAL):
-        day -= datetime.timedelta(days=1)
-        while day.weekday() >= 5:
-            day -= datetime.timedelta(days=1)
-    return day.strftime('%Y-%m-%d')
+        gap = (datetime.date.fromisoformat(estimate) - datetime.date.fromisoformat(last_date)).days
+        if gap < INDEX_STALE_DAYS:
+            return last_date
+        print(f"[주식] 지수 데이터가 {last_date}에서 멈춰 있어 믿을 수 없습니다. 평일 기준 {estimate}로 저장합니다.")
+
+    return estimate
 
 
 def save_dataframe_to_csv(df, file_path):
