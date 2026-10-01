@@ -7,7 +7,7 @@ import schedule
 
 from utils import random_delay, now_kst
 from news_crawler import fetch_news_urls, parse_news_article, save_news_to_json
-from stock_crawler import collect_stock_snapshot, is_market_hours
+from stock_crawler import collect_stock_snapshot, is_market_hours, SKIPPED
 from ai_analyzer import run_track1_daily_clustering
 from db_client import insert_raw_news_to_db, insert_track1_report_to_db, get_track1_report_by_date
 
@@ -24,6 +24,12 @@ ARCHIVE_ROOT = os.path.join(PROJECT_ROOT, "archive_data")
 
 
 def run_daily_job():
+    """
+    뉴스·주식 수집과 AI 분석을 한 번 실행합니다.
+    반환값: 실패한 단계 이름 목록 (빈 목록이면 모두 성공)
+    """
+    failures = []
+
     # 1. 현재 시간을 기준으로 날짜 정보 추출
     now = now_kst()
     now_str = now.strftime('%Y-%m-%d %H:%M:%S')
@@ -37,7 +43,8 @@ def run_daily_job():
     print(f"\n--- [시작] {now_str} 일일 데이터 심층 수집 가동 ---")
 
     print("\n1. 한국거래소(KRX) 전체 주식 데이터 수집 중... (06:00 수집분 = 전 거래일 확정 시세)")
-    collect_stock_snapshot(ARCHIVE_ROOT)
+    if collect_stock_snapshot(ARCHIVE_ROOT) is None:
+        failures.append("주식 시세 저장")
 
     print("\n2. 다분야 뉴스 데이터 심층 수집 중 (테스트용 분야별 10개)...")
 
@@ -67,7 +74,8 @@ def run_daily_job():
 
         # 크롤링한 리스트를 바로 DB 원본 테이블에 저장합니다.
         print("\n3. DB에 원본 뉴스 데이터를 일괄 저장합니다...")
-        insert_raw_news_to_db(crawled_news)
+        if not insert_raw_news_to_db(crawled_news):
+            failures.append("원본 뉴스 DB 저장")
 
         # 크롤링한 리스트(메모리 객체)를 그대로 AI 분석기에 전달합니다.
         print("\n4. AI 뉴스 테마 교차 분석 및 정제를 시작합니다...")
@@ -81,9 +89,18 @@ def run_daily_job():
                 "sectors": report_result["sectors"],
                 "cross_correlations": report_result["cross_correlations"]
             }
-            insert_track1_report_to_db(report_data)
+            if not insert_track1_report_to_db(report_data):
+                failures.append("AI 리포트 DB 저장")
+        else:
+            failures.append("AI 리포트 생성")
+    else:
+        failures.append("뉴스 수집 (기사 0건)")
 
-    print(f"\n--- [종료] 일일 심층 데이터 수집 및 분석이 완료되었습니다 ---")
+    if failures:
+        print(f"\n--- [종료] 일부 단계가 실패했습니다: {', '.join(failures)} ---")
+    else:
+        print(f"\n--- [종료] 일일 심층 데이터 수집 및 분석이 완료되었습니다 ---")
+    return failures
 
 
 def safe_run_daily_job():
@@ -150,9 +167,12 @@ if __name__ == "__main__":
     # python main.py        → 스케줄러 모드 (매일 06:00 자동 실행, 놓친 작업은 즉시 보충)
     # python main.py --now  → 지금 한 번만 실행하고 종료 (테스트용)
     # python main.py --stock → 주식 시세만 지금 저장하고 종료 (장중에는 건너뜀)
+    # 실패하면 종료 코드 1로 끝내서 GitHub Actions에 빨간 X(실패)가 표시되게 합니다.
     if "--stock" in sys.argv:
-        collect_stock_snapshot(ARCHIVE_ROOT)
+        if collect_stock_snapshot(ARCHIVE_ROOT) is None:
+            sys.exit(1)
     elif "--now" in sys.argv:
-        run_daily_job()
+        if run_daily_job():
+            sys.exit(1)
     else:
         main()

@@ -93,6 +93,10 @@ def save_dataframe_to_csv(df, file_path):
     print(f"총 {len(df)}개 종목의 데이터가 성공적으로 저장되었습니다: {file_path}")
 
 
+# 장중이라 일부러 저장을 건너뛴 경우의 반환값 (실패와 구분)
+SKIPPED = "skipped"
+
+
 def collect_stock_snapshot(archive_root, save_to_db=True):
     """
     전 종목 시세 + 지수 데이터를 '거래일' 기준으로 저장합니다.
@@ -105,10 +109,11 @@ def collect_stock_snapshot(archive_root, save_to_db=True):
     now = now_kst()
     if is_market_hours(now):
         print("현재 장중이라 시세가 확정되지 않았습니다. 주식 데이터 저장을 건너뜁니다. (장 마감 후 16:00에 자동 수집)")
-        return None
+        return SKIPPED
 
     stock_df = fetch_all_stock_data()
     if stock_df is None or stock_df.empty:
+        print("[주식] 전 종목 시세를 가져오지 못해 저장하지 못했습니다.")
         return None
 
     index_history = fetch_index_history()
@@ -120,8 +125,17 @@ def collect_stock_snapshot(archive_root, save_to_db=True):
     if save_to_db:
         from db_client import upsert_stock_daily, upsert_stock_prices
         rows = parse_stock_records(stock_df.to_dict('records'))
-        upsert_stock_daily(build_daily_record(trade_date, collected_at, rows, index_history))
-        upsert_stock_prices(build_price_rows(trade_date, rows))
+        print(f"[주식] 종목 {len(rows)}개, 지수 마지막 날짜: "
+              f"코스피 {(index_history.get('KS11') or [{}])[-1].get('date', '없음')}, "
+              f"코스닥 {(index_history.get('KQ11') or [{}])[-1].get('date', '없음')}")
+        if not rows:
+            print("[주식] 코스피·코스닥 종목이 0개라 저장하지 않습니다.")
+            return None
+        ok_daily = upsert_stock_daily(build_daily_record(trade_date, collected_at, rows, index_history))
+        ok_prices = upsert_stock_prices(build_price_rows(trade_date, rows))
+        if not (ok_daily and ok_prices):
+            print("[주식] Supabase 저장에 실패했습니다. 위의 [DB 저장 실패] 메시지를 확인하세요.")
+            return None
 
     # --- 3) 로컬 백업 (클라우드에서는 실행이 끝나면 사라지지만 오류 없이 넘어갑니다) ---
     try:
