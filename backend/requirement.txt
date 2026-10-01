@@ -1,0 +1,10 @@
+google-genai
+pydantic
+supabase
+python-dotenv
+schedule
+beautifulsoup4
+finance-datareader
+requests
+fastapi
+uvicorn
