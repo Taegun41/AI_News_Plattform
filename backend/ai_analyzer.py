@@ -47,6 +47,67 @@ class Track2AIOutput(BaseModel):
     key_urls: list[str]
 # ----------------------------------------------------
 
+# --- [Gemini 호출 공통 설정] ---
+# 기본 모델과, 기본 모델이 혼잡(503)할 때 번갈아 시도할 예비 모델 목록.
+# .env 또는 GitHub Secrets/환경변수로 바꿀 수 있습니다. (예: GEMINI_FALLBACK_MODELS=gemini-2.5-flash,gemini-2.5-flash-lite)
+PRIMARY_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+FALLBACK_MODELS = [m.strip() for m in os.getenv("GEMINI_FALLBACK_MODELS", "gemini-2.5-flash").split(",") if m.strip()]
+
+# 재시도 사이 대기 시간(초). Gemini 혼잡은 보통 몇 분 안에 풀리므로 점점 길게 기다립니다. (합계 약 12분)
+TRACK1_RETRY_WAITS = [20, 40, 60, 120, 180, 300]
+TRACK1_STEP2_RETRY_WAITS = [20, 60, 120]  # 2단계(교차 분석)는 없어도 리포트가 만들어지므로 짧게
+
+_TRANSIENT_MARKERS = ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "500", "INTERNAL", "DEADLINE", "timed out", "Timeout")
+_MODEL_MISSING_MARKERS = ("404", "NOT_FOUND", "is not found", "not supported")
+
+
+def generate_json_with_retry(contents, schema, label, retry_waits, api_client=None):
+    """
+    Gemini에 JSON 응답을 요청하고, 실패하면 기다렸다가 다시 시도합니다.
+    - 시도할 때마다 기본 모델 → 예비 모델 순으로 번갈아 사용합니다.
+    - 존재하지 않는 모델(404)은 목록에서 빼고 바로 다음 모델로 넘어갑니다.
+    성공하면 파싱된 JSON, 끝내 실패하면 None을 돌려줍니다.
+    """
+    api_client = api_client or client
+    models = list(dict.fromkeys([PRIMARY_MODEL] + FALLBACK_MODELS))
+    total_attempts = len(retry_waits) + 1
+    attempt = 0
+
+    while attempt < total_attempts and models:
+        model = models[attempt % len(models)]
+        try:
+            response = api_client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=schema
+                )
+            )
+            if not response.text:
+                raise ValueError("Gemini가 빈 응답을 반환했습니다. (안전 필터에 걸렸을 수 있습니다)")
+            result = json.loads(response.text)
+            if model != PRIMARY_MODEL:
+                print(f"[{label}] 예비 모델 {model}로 성공했습니다.")
+            return result
+        except Exception as e:
+            message = str(e)
+            if any(marker in message for marker in _MODEL_MISSING_MARKERS) and model != PRIMARY_MODEL:
+                print(f"[{label}] 예비 모델 {model}을(를) 사용할 수 없어 목록에서 제외합니다: {message[:120]}")
+                models.remove(model)
+                continue  # 시도 횟수를 쓰지 않고 바로 다음 모델로
+
+            print(f"오류: {label} 중 문제 발생 (시도 {attempt + 1}/{total_attempts}, 모델 {model}) - {message[:300]}")
+            if attempt < len(retry_waits):
+                wait = retry_waits[attempt]
+                kind = "일시적 혼잡으로 보입니다. " if any(m in message for m in _TRANSIENT_MARKERS) else ""
+                print(f"  → {kind}{wait}초 후 다시 시도합니다.")
+                time.sleep(wait)
+            attempt += 1
+
+    return None
+# ----------------------------------------------------
+
 def run_track1_daily_clustering(raw_news_data):
     """
     [트랙 1] 원본 뉴스 데이터를 받아 분야별 클러스터링 및 교차 분석을 수행합니다.
@@ -70,40 +131,20 @@ def run_track1_daily_clustering(raw_news_data):
     {news_text}
     """
 
-    refined_sectors = None
-    max_retries = 3
-    
-    # 1단계: 분야별 클러스터링
-    for attempt in range(max_retries):
-        try:
-            response_step1 = client.models.generate_content(
-                model='gemini-3.5-flash',
-                contents=prompt_step1,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=list[SectorReport]
-                )
-            )
-            refined_sectors = json.loads(response_step1.text)
-            
-            # --- [핵심 추가 로직] 원본 기사의 썸네일 URL을 AI 결과물에 병합 ---
-            thumb_dict = {article.get('url'): article.get('thumbnail_url') for article in raw_news_data}
-            
-            for sector in refined_sectors:
-                for issue in sector['issues']:
-                    main_url = issue.get('main_article_url')
-                    # 매핑되는 썸네일이 없으면 방어적으로 Unsplash 기본 이미지 삽입
-                    issue['thumbnail_url'] = thumb_dict.get(main_url) or "https://images.unsplash.com/photo-1611162617474-5b21e879e113?q=80&w=1200&auto=format&fit=crop"
-            # -----------------------------------------------------------------
-            
-            print("[1단계 완료] 분야별 정제가 성공적으로 끝났습니다.")
-            break
-        except Exception as e:
-            print(f"오류: 1단계 분석 중 문제 발생. (시도 {attempt + 1}/{max_retries}) - {e}")
-            if attempt < max_retries - 1:
-                time.sleep(15 * (attempt + 1))
-            else:
-                return None
+    # 1단계: 분야별 클러스터링 (Gemini 혼잡에 대비해 최대 약 12분간 재시도)
+    refined_sectors = generate_json_with_retry(prompt_step1, list[SectorReport], "1단계 분석", TRACK1_RETRY_WAITS)
+    if not refined_sectors:
+        print("1단계 분석이 끝내 실패했습니다.")
+        return None
+
+    # --- [핵심 추가 로직] 원본 기사의 썸네일 URL을 AI 결과물에 병합 ---
+    thumb_dict = {article.get('url'): article.get('thumbnail_url') for article in raw_news_data}
+    for sector in refined_sectors:
+        for issue in sector['issues']:
+            main_url = issue.get('main_article_url')
+            # 매핑되는 썸네일이 없으면 방어적으로 Unsplash 기본 이미지 삽입
+            issue['thumbnail_url'] = thumb_dict.get(main_url) or "https://images.unsplash.com/photo-1611162617474-5b21e879e113?q=80&w=1200&auto=format&fit=crop"
+    print("[1단계 완료] 분야별 정제가 성공적으로 끝났습니다.")
 
     if not refined_sectors:
         return None
@@ -118,29 +159,13 @@ def run_track1_daily_clustering(raw_news_data):
     {json.dumps(refined_sectors, ensure_ascii=False)}
     """
 
-    cross_correlations = []
-    
-    # 2단계: 교차 분석
-    for attempt in range(max_retries):
-        try:
-            response_step2 = client.models.generate_content(
-                model='gemini-3.5-flash',
-                contents=prompt_step2,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=list[CrossCorrelation]
-                )
-            )
-            cross_correlations = json.loads(response_step2.text)
-            print("[2단계 완료] 교차 분석이 성공적으로 끝났습니다.")
-            break
-        except Exception as e:
-            print(f"오류: 2단계 분석 중 문제 발생. (시도 {attempt + 1}/{max_retries}) - {e}")
-            if attempt < max_retries - 1:
-                time.sleep(15 * (attempt + 1))
-            else:
-                print("2단계 분석 실패. 1단계 결과만 반환합니다.")
-                break
+    # 2단계: 교차 분석 (실패해도 1단계 결과로 리포트는 만듭니다)
+    cross_correlations = generate_json_with_retry(prompt_step2, list[CrossCorrelation], "2단계 교차 분석", TRACK1_STEP2_RETRY_WAITS)
+    if cross_correlations is None:
+        print("2단계 분석 실패. 1단계 결과만 반환합니다.")
+        cross_correlations = []
+    else:
+        print("[2단계 완료] 교차 분석이 성공적으로 끝났습니다.")
 
     return {
         "sectors": refined_sectors,
