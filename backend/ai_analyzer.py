@@ -1,13 +1,18 @@
+import os
 import json
-import datetime
-import difflib
 import time
+import difflib
+from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from pydantic import BaseModel
-from db_client import insert_track1_report_to_db
 
-# --- 1차 분석 스키마 (분야별 뉴스 정제) ---
+# 환경 변수 로드 및 Gemini 클라이언트 초기화
+load_dotenv()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+# --- [Pydantic 스키마 정의] 프론트엔드와 동일한 구조 ---
 class IssueCluster(BaseModel):
     issue_name: str
     article_count: int
@@ -19,52 +24,48 @@ class SectorReport(BaseModel):
     sector_name: str
     issues: list[IssueCluster]
 
-# --- 2차 분석 스키마 (교차 연관도 도출) ---
 class CrossCorrelation(BaseModel):
     correlation_theme: str
     description: str
     related_sectors: list[str]
     key_urls: list[str]
 
-# --- 트랙 2 분석 스키마 (동적 키워드 탐색) ---
 class Track2Report(BaseModel):
     search_keyword: str
     theme_summary: str
     detailed_viewpoints: list[str]
     impact_analysis: str
     key_urls: list[str]
+    meta_info: str | None = None
+# ----------------------------------------------------
 
-
-def run_track1_daily_clustering(raw_news_data, api_key):
+def run_track1_daily_clustering(raw_news_data):
     """
-    [트랙 1] 1단계: 분야별 뉴스 정제 -> 2단계: 교차 연관도 분석
+    [트랙 1] 원본 뉴스 데이터를 받아 분야별 클러스터링 및 교차 분석을 수행합니다.
     """
-    client = genai.Client(api_key=api_key)
-    
     if not raw_news_data:
         print("분석할 뉴스 데이터가 없습니다.")
         return None
 
-    # --- [1단계] 분야별 뉴스 정제 및 클러스터링 ---
     print("\n[트랙 1 - 1단계] 분야별 기사 정제 및 클러스터링을 시작합니다...")
     
+    # AI에게 전달할 뉴스 텍스트 생성
+    news_text = ""
+    for idx, article in enumerate(raw_news_data):
+        news_text += f"[{idx+1}] 제목: {article.get('title')}\nURL: {article.get('url')}\n내용: {article.get('body')[:200]}...\n\n"
+
     prompt_step1 = f"""
-    당신은 데이터 분류 전문가입니다. 제공된 뉴스 데이터를 'theme_sector' 기준으로 분류하세요.
-    각 분야(경제, 정치, IT/과학 등) 내에서 주제가 동일한 기사들을 묶어 이슈(issue_name)를 만들고, 
-    해당 이슈에 속한 기사의 총 개수(article_count)를 세어주세요.
-    반드시 기사 수가 많은 이슈부터 내림차순으로 정렬하여 반환하세요.
+    다음은 오늘 수집된 뉴스 기사들입니다. 이 기사들을 '정치', '경제', '사회', 'IT/과학', '세계' 등의 분야(sector_name)로 분류하고, 
+    각 분야별로 핵심 이슈(issue_name)를 묶어주세요.
     
-    [절대 지켜야 할 제약사항]
-    1. 반드시 원본 뉴스 데이터에 존재하는 실제 'url'만 추출하세요. 절대 example.com 같은 가상의 주소를 지어내지 마세요.
-    2. 모든 내용은 한국어로 작성하세요.
-    
-    원본 뉴스 데이터:
-    {json.dumps(raw_news_data, ensure_ascii=False)}
+    [뉴스 기사]
+    {news_text}
     """
-    
+
     refined_sectors = None
     max_retries = 3
     
+    # 1단계: 분야별 클러스터링
     for attempt in range(max_retries):
         try:
             response_step1 = client.models.generate_content(
@@ -76,6 +77,17 @@ def run_track1_daily_clustering(raw_news_data, api_key):
                 )
             )
             refined_sectors = json.loads(response_step1.text)
+            
+            # --- [핵심 추가 로직] 원본 기사의 썸네일 URL을 AI 결과물에 병합 ---
+            thumb_dict = {article.get('url'): article.get('thumbnail_url') for article in raw_news_data}
+            
+            for sector in refined_sectors:
+                for issue in sector['issues']:
+                    main_url = issue.get('main_article_url')
+                    # 매핑되는 썸네일이 없으면 방어적으로 Unsplash 기본 이미지 삽입
+                    issue['thumbnail_url'] = thumb_dict.get(main_url) or "https://images.unsplash.com/photo-1611162617474-5b21e879e113?q=80&w=1200&auto=format&fit=crop"
+            # -----------------------------------------------------------------
+            
             print("[1단계 완료] 분야별 정제가 성공적으로 끝났습니다.")
             break
         except Exception as e:
@@ -88,23 +100,19 @@ def run_track1_daily_clustering(raw_news_data, api_key):
     if not refined_sectors:
         return None
 
-    # --- [2단계] 교차 연관도 도출 ---
-    print("\n[트랙 1 - 2단계] 정제된 데이터를 바탕으로 교차 연관도 분석을 시작합니다...")
+    print("\n[트랙 1 - 2단계] 분야 간 교차 분석을 시작합니다...")
     
     prompt_step2 = f"""
-    당신은 거시 경제 분석가입니다. 1차로 정제된 분야별 리포트를 보고 서로 다른 분야 간의 연관성을 찾으세요.
+    다음은 1단계에서 분류된 분야별 핵심 이슈들입니다.
+    이 이슈들 간의 연관성을 분석하여 교차 테마(CrossCorrelation)를 도출해주세요.
     
-    [절대 지켜야 할 제약사항]
-    1. 1차 정제된 데이터 요약본에 존재하는 실제 URL만 추출해서 key_urls에 넣으세요. 가상의 URL은 절대 불가합니다.
-    2. related_sectors 항목은 'Technology', 'Finance' 같은 영어가 아닌 'IT/과학', '경제' 등 한글 섹터명으로 작성하세요.
-    3. 억지로 연결하지 말고, 실제로 강한 연관성이 있는 경우에만 추출하세요.
-    
-    1차 정제된 데이터 요약본:
+    [분야별 이슈]
     {json.dumps(refined_sectors, ensure_ascii=False)}
     """
+
+    cross_correlations = []
     
-    cross_correlations = None
-    
+    # 2단계: 교차 분석
     for attempt in range(max_retries):
         try:
             response_step2 = client.models.generate_content(
@@ -116,27 +124,21 @@ def run_track1_daily_clustering(raw_news_data, api_key):
                 )
             )
             cross_correlations = json.loads(response_step2.text)
-            print("[2단계 완료] 교차 연관도 분석이 성공적으로 끝났습니다.")
+            print("[2단계 완료] 교차 분석이 성공적으로 끝났습니다.")
             break
         except Exception as e:
             print(f"오류: 2단계 분석 중 문제 발생. (시도 {attempt + 1}/{max_retries}) - {e}")
             if attempt < max_retries - 1:
                 time.sleep(15 * (attempt + 1))
             else:
-                return None
+                print("2단계 분석 실패. 1단계 결과만 반환합니다.")
+                break
 
-    # --- [3단계] 최종 데이터 병합 및 DB 저장 ---
-    final_report = {
-        "report_date": datetime.datetime.now().strftime('%Y-%m-%d'),
+    return {
         "sectors": refined_sectors,
-        "cross_correlations": cross_correlations if cross_correlations else []
+        "cross_correlations": cross_correlations
     }
     
-    insert_track1_report_to_db(final_report)
-    print("\n[트랙 1 최종 완료] 모든 분석이 끝나고 DB에 저장되었습니다.")
-    return final_report
-
-
 def calculate_similarity(text1, text2):
     return difflib.SequenceMatcher(None, text1, text2).ratio()
 

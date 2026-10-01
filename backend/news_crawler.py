@@ -13,6 +13,23 @@ SECTION_MAP = {
     "105": "IT/과학"
 }
 
+def extract_thumbnail_url(soup):
+    """
+    기사의 메타 태그를 분석하여 대표 썸네일 이미지를 추출합니다.
+    """
+    # 1순위: og:image 탐색 (가장 정확함)
+    og_image = soup.find('meta', property='og:image')
+    if og_image and og_image.get('content'):
+        return og_image['content']
+        
+    # 2순위: twitter:image 탐색
+    twitter_image = soup.find('meta', attrs={'name': 'twitter:image'})
+    if twitter_image and twitter_image.get('content'):
+        return twitter_image['content']
+        
+    # 3순위: 이미지가 아예 없는 기사일 경우 기본 매거진 이미지 반환
+    return "https://images.unsplash.com/photo-1611162617474-5b21e879e113?q=80&w=1200&auto=format&fit=crop"
+
 def fetch_news_urls(section_id="101", target_count=10):
     """
     지정된 분야의 기사 URL을 target_count 개수만큼 페이지를 넘기며 수집합니다.
@@ -22,7 +39,7 @@ def fetch_news_urls(section_id="101", target_count=10):
     
     while len(urls) < target_count:
         url = f"https://news.naver.com/main/list.naver?mode=LSD&mid=sec&sid1={section_id}&page={page}"
-        session = get_secure_session() # 페이지를 넘길 때도 브라우저 신분을 바꿉니다.
+        session = get_secure_session() 
         
         try:
             response = session.get(url)
@@ -38,7 +55,6 @@ def fetch_news_urls(section_id="101", target_count=10):
             
             new_urls = set(page_urls) - urls
             
-            # 마지막 페이지에 도달하여 더 이상 새로운 기사가 없으면 탐색 종료
             if not new_urls:
                 break
                 
@@ -50,15 +66,14 @@ def fetch_news_urls(section_id="101", target_count=10):
             print(f"URL 목록 수집 중 오류 발생: {e}")
             break
             
-    # set은 순서가 없으므로 리스트로 변환 후 정확히 target_count 개수만 잘라서 반환합니다.
     return list(urls)[:target_count]
 
 
 def parse_news_article(url, section_id):
     """
-    단일 네이버 뉴스 기사에서 제목, 본문, 작성일, 그리고 테마 섹터를 추출합니다.
+    단일 네이버 뉴스 기사에서 제목, 본문, 작성일, 테마 섹터, 그리고 썸네일 이미지를 추출합니다.
     """
-    session = get_secure_session() # 기사 본문을 읽을 때마다 새로운 브라우저로 위장합니다.
+    session = get_secure_session() 
     
     try:
         response = session.get(url)
@@ -74,12 +89,17 @@ def parse_news_article(url, section_id):
         body = body_element.get_text(separator=' ', strip=True) if body_element else "본문 없음"
         date = date_element.attrs.get('data-date-time', '날짜 없음') if date_element else "날짜 없음"
         
+        # 추가된 로직: 앞서 정의한 썸네일 추출 함수 호출
+        thumbnail_url = extract_thumbnail_url(soup)
+        
+        # 반환하는 딕셔너리에 thumbnail_url 추가
         return {
-            'theme_sector': SECTION_MAP.get(section_id, '기타'), # AI 분석을 돕기 위한 섹터 태그 추가
+            'theme_sector': SECTION_MAP.get(section_id, '기타'), 
             'url': url,
             'title': title,
             'body': body,
-            'date': date
+            'date': date,
+            'thumbnail_url': thumbnail_url 
         }
 
     except Exception as e:
@@ -114,7 +134,6 @@ if __name__ == "__main__":
         year_month = now.strftime('%Y-%m')
         today_str = now.strftime('%Y%m%d')
         
-        # 변경된 경로: archive_data/news/년-월
         archive_dir = os.path.join("archive_data", "news", year_month)
         os.makedirs(archive_dir, exist_ok=True)
         

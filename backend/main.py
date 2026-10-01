@@ -8,6 +8,7 @@ from news_crawler import fetch_news_urls, parse_news_article, save_news_to_json
 from stock_crawler import fetch_all_stock_data, save_dataframe_to_csv
 from ai_analyzer import run_track1_daily_clustering
 from db_client import insert_raw_news_to_db
+from datetime import datetime
 
 def run_daily_job():
     # 1. 현재 시간을 기준으로 날짜 정보 추출
@@ -67,7 +68,7 @@ def run_daily_job():
         
         # 추후 보안을 위해 os.getenv를 사용하되, 지금은 기본값으로 키를 유지합니다.
         API_KEY = os.getenv("GEMINI_API_KEY")        
-        run_track1_daily_clustering(crawled_news, API_KEY)
+        run_track1_daily_clustering(crawled_news)
         
     print(f"\n--- [종료] 일일 심층 데이터 수집 및 분석이 완료되었습니다 ---")
 
